@@ -14,6 +14,11 @@
     <li class="nav-item">
       <a class="nav-link{% block content_tab_class %}{% endblock %}" href="{{ url_for('table_content', table=table) }}">Content</a>
     </li>
+    {% if not is_view %}
+    <li class="nav-item">
+      <a class="nav-link{% block matrix_tab_class %}{% endblock %}" href="{{ url_for('table_matrix', table=table) }}">Matrix</a>
+    </li>
+    {% endif %}
     <li class="nav-item">
       <a class="nav-link{% block query_tab_class %}{% endblock %}" href="{{ url_for('table_query', table=table) }}">Query</a>
     </li>

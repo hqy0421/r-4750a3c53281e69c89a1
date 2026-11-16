@@ -152,6 +152,66 @@ ul.pagination .page-item.disabled .page-link {
     color: #aaaaaa;
 }
 
+/* Attribute matrix. Catalog headers stick while the grid scrolls. */
+div.matrix-wrapper {
+    max-height: 75vh;
+    overflow: auto;
+}
+table.matrix-table th {
+    white-space: nowrap;
+}
+table.matrix-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background-color: #ffffff;
+}
+table.matrix-table thead th.matrix-corner {
+    left: 0;
+    z-index: 3;
+}
+table.matrix-table tbody th {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background-color: #ffffff;
+}
+table.matrix-table tbody tr:nth-of-type(odd) th {
+    background-color: rgba(0, 0, 0, .05);
+}
+td.matrix-cell {
+    min-width: 3rem;
+    text-align: center;
+}
+td.matrix-editable {
+    cursor: pointer;
+}
+td.matrix-no-record {
+    background-color: #fafafa;
+}
+span.matrix-absent {
+    color: #cccccc;
+}
+code.matrix-null {
+    color: #888888;
+}
+span.matrix-empty-text {
+    color: #999999;
+    font-style: italic;
+}
+span.matrix-pk {
+    color: #aaaaaa;
+    font-size: 11px;
+    font-weight: normal;
+}
+td.matrix-stale {
+    outline: 2px solid #f0ad4e;
+    outline-offset: -2px;
+}
+td.matrix-saved {
+    animation: cell-copied .8s ease-out;
+}
+
 
 /* Small screens. */
 @media (max-width: 1200px) {

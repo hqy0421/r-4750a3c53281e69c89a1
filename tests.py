@@ -990,5 +990,323 @@ class TestUrlPrefix(BaseAppTestCase):
         self.assertIn('Path=/sqlite', r.headers['Set-Cookie'])
 
 
+class TestMatrix(BaseAppTestCase):
+    SCHEMA = """
+        CREATE TABLE product (id INTEGER PRIMARY KEY, name TEXT);
+        INSERT INTO product (name) VALUES ('alpha'), ('dup'), ('dup');
+        CREATE TABLE attribute (id INTEGER PRIMARY KEY, name TEXT);
+        INSERT INTO attribute (name) VALUES ('color'), ('size'), ('dup'), ('dup');
+        CREATE TABLE pa (id INTEGER PRIMARY KEY,
+            product_id INTEGER NOT NULL REFERENCES product(id),
+            attribute_id INTEGER NOT NULL REFERENCES attribute(id),
+            value,
+            UNIQUE (product_id, attribute_id));
+        INSERT INTO pa (product_id, attribute_id, value) VALUES
+            (1, 1, 'red'),
+            (1, 2, 42),
+            (2, 1, 3.5),
+            (2, 2, NULL),
+            (3, 3, x'0aff');
+        CREATE TABLE pa_nn (id INTEGER PRIMARY KEY,
+            product_id INTEGER NOT NULL REFERENCES product(id),
+            attribute_id INTEGER NOT NULL REFERENCES attribute(id),
+            value TEXT NOT NULL,
+            UNIQUE (product_id, attribute_id));
+        INSERT INTO pa_nn (product_id, attribute_id, value) VALUES (1, 1, 'keep');
+        CREATE TABLE pa_flat (id INTEGER PRIMARY KEY,
+            product_id INTEGER, attribute_id INTEGER, value);
+        CREATE TABLE pa_comp (a INTEGER, b INTEGER, value,
+            PRIMARY KEY (a, b));
+        CREATE TABLE blobs (id BLOB PRIMARY KEY, note TEXT);
+        CREATE VIEW v_pa AS SELECT * FROM pa;
+    """
+
+    def dbwrite(self, sql, *params):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(sql, params)
+        conn.commit()
+        conn.close()
+
+    def matrix_post(self, table='pa', **kw):
+        data = {
+            'row_col': 'product_id', 'row_cat': 'product',
+            'col_col': 'attribute_id', 'col_cat': 'attribute',
+            'val_col': 'value'}
+        data.update(kw)
+        return self.client.post('/%s/matrix/update/' % table, data=data)
+
+    def cell_state(self, row_key, col_key, table='pa'):
+        rows = self.dbrows(
+            'SELECT id, value FROM %s '
+            'WHERE product_id = ? AND attribute_id = ?' % table,
+            row_key, col_key)
+        if not rows:
+            return '', 'empty'
+        rec_pk, value = rows[0]
+        vtype = sw._matrix_value_type(value)
+        text = sw._matrix_value_text(value, vtype)
+        return key_encode([rec_pk]), sw._matrix_fingerprint(vtype, text)
+
+    def post_save(self, row_key, col_key, vtype, value, table='pa'):
+        record, base = self.cell_state(row_key, col_key, table)
+        return self.matrix_post(
+            table=table, action='save', row_key=row_key, col_key=col_key,
+            record=record, base=base, vtype=vtype, value=value)
+
+    def test_matrix_tab_linked_from_table_pages(self):
+        r = self.client.get('/pa/content/')
+        self.assertIn(b'/pa/matrix/', r.data)
+        # Views have no matrix tab.
+        r = self.client.get('/v_pa/content/')
+        self.assertNotIn(b'/v_pa/matrix/', r.data)
+
+    def test_matrix_page_renders_catalog_driven_grid(self):
+        r = self.client.get('/pa/matrix/')
+        self.assertEqual(r.status_code, 200)
+        for label in (b'alpha', b'color', b'size', b'dup'):
+            self.assertIn(label, r.data)
+        # Catalog entries with no records still render: product 3 has empty
+        # cells and attribute 4 has no records at all.
+        self.assertIn(b'data-row-key="3"', r.data)
+        self.assertIn(b'data-col-key="4"', r.data)
+        # Primary keys display next to every label.
+        self.assertIn(b'#4', r.data)
+        self.assertIn(b'#3', r.data)
+
+    def test_absent_null_and_empty_text_are_distinct(self):
+        r = self.client.get('/pa/matrix/')
+        self.assertIn(b'matrix-absent', r.data)  # No-record cells.
+        self.assertIn(b'matrix-null', r.data)    # Stored NULL at (2, 2).
+        self.assertIn(b'matrix-blob', r.data)    # Stored blob at (3, 3).
+        r = self.post_save(3, 1, 'text', '')
+        self.assertEqual(r.status_code, 200)
+        r = self.client.get('/pa/matrix/')
+        self.assertIn(b'matrix-empty-text', r.data)
+        rows = self.dbrows(
+            'SELECT value, typeof(value) FROM pa '
+            'WHERE product_id = 3 AND attribute_id = 1')
+        self.assertEqual(rows, [('', 'text')])
+
+    def test_insert_preserves_each_storage_class(self):
+        cases = [
+            (3, 1, 'text', 'hello', 'hello', 'text'),
+            (3, 2, 'integer', '42', 42, 'integer'),
+            (1, 3, 'real', '2.5', 2.5, 'real'),
+            (1, 4, 'blob', '0aff', b'\x0a\xff', 'blob'),
+            (2, 3, 'null', '', None, 'null'),
+        ]
+        for row_key, col_key, vtype, sent, stored, typeof in cases:
+            r = self.post_save(row_key, col_key, vtype, sent)
+            self.assertEqual(r.status_code, 200, (vtype, r.data))
+            self.assertTrue(r.get_json()['ok'])
+            rows = self.dbrows(
+                'SELECT value, typeof(value) FROM pa '
+                'WHERE product_id = ? AND attribute_id = ?', row_key, col_key)
+            self.assertEqual(rows, [(stored, typeof)], vtype)
+
+    def test_update_keeps_record_primary_key(self):
+        before = self.dbrows(
+            'SELECT id FROM pa WHERE product_id = 1 AND attribute_id = 1')
+        r = self.post_save(1, 1, 'text', 'blue')
+        self.assertEqual(r.status_code, 200)
+        after = self.dbrows(
+            'SELECT id, value FROM pa WHERE product_id = 1 AND attribute_id = 1')
+        self.assertEqual(after, [(before[0][0], 'blue')])
+
+    def test_null_write_counts_as_existing_record(self):
+        before = self.dbrows(
+            'SELECT id FROM pa WHERE product_id = 1 AND attribute_id = 1')
+        r = self.post_save(1, 1, 'null', '')
+        self.assertEqual(r.status_code, 200)
+        rows = self.dbrows(
+            'SELECT id, value, typeof(value) FROM pa '
+            'WHERE product_id = 1 AND attribute_id = 1')
+        self.assertEqual(rows, [(before[0][0], None, 'null')])
+
+    def test_remove_is_the_only_delete(self):
+        record, base = self.cell_state(1, 1)
+        r = self.matrix_post(action='remove', row_key=1, col_key=1,
+                             record=record, base=base)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(
+            self.dbrows('SELECT COUNT(*) FROM pa '
+                        'WHERE product_id = 1 AND attribute_id = 1')[0][0], 0)
+        # The cell is empty again and a NULL write creates a fresh record.
+        r = self.post_save(1, 1, 'null', '')
+        self.assertEqual(r.status_code, 200)
+        rows = self.dbrows(
+            'SELECT typeof(value) FROM pa '
+            'WHERE product_id = 1 AND attribute_id = 1')
+        self.assertEqual(rows, [('null',)])
+
+    def test_stale_after_external_delete(self):
+        record, base = self.cell_state(1, 1)
+        self.dbwrite('DELETE FROM pa WHERE product_id = 1 AND attribute_id = 1')
+        r = self.matrix_post(action='save', row_key=1, col_key=1,
+                             record=record, base=base, vtype='text', value='x')
+        self.assertEqual(r.status_code, 409)
+        self.assertTrue(r.get_json()['stale'])
+        self.assertEqual(
+            self.dbrows('SELECT COUNT(*) FROM pa '
+                        'WHERE product_id = 1 AND attribute_id = 1')[0][0], 0)
+
+    def test_stale_after_external_update(self):
+        record, base = self.cell_state(1, 1)
+        self.dbwrite("UPDATE pa SET value = 'changed' "
+                     'WHERE product_id = 1 AND attribute_id = 1')
+        r = self.matrix_post(action='save', row_key=1, col_key=1,
+                             record=record, base=base, vtype='text', value='x')
+        self.assertEqual(r.status_code, 409)
+        rows = self.dbrows(
+            'SELECT value FROM pa WHERE product_id = 1 AND attribute_id = 1')
+        self.assertEqual(rows, [('changed',)])
+
+    def test_stale_after_external_replace(self):
+        # Delete + re-insert gives the cell a new pk; the old token is stale.
+        record, base = self.cell_state(1, 1)
+        self.dbwrite('DELETE FROM pa WHERE product_id = 1 AND attribute_id = 1')
+        self.dbwrite("INSERT INTO pa (product_id, attribute_id, value) "
+                     "VALUES (1, 1, 'replaced')")
+        r = self.matrix_post(action='save', row_key=1, col_key=1,
+                             record=record, base=base, vtype='text', value='x')
+        self.assertEqual(r.status_code, 409)
+        rows = self.dbrows(
+            'SELECT value FROM pa WHERE product_id = 1 AND attribute_id = 1')
+        self.assertEqual(rows, [('replaced',)])
+
+    def test_stale_after_external_insert_into_empty_cell(self):
+        record, base = self.cell_state(3, 1)
+        self.assertEqual((record, base), ('', 'empty'))
+        self.dbwrite("INSERT INTO pa (product_id, attribute_id, value) "
+                     "VALUES (3, 1, 'sneaky')")
+        r = self.matrix_post(action='save', row_key=3, col_key=1,
+                             record='', base='empty', vtype='text', value='x')
+        self.assertEqual(r.status_code, 409)
+        rows = self.dbrows(
+            'SELECT value FROM pa WHERE product_id = 3 AND attribute_id = 1')
+        self.assertEqual(rows, [('sneaky',)])
+
+    def test_constraint_failure_leaves_other_cells_alone(self):
+        before = self.dbrows('SELECT * FROM pa_nn ORDER BY id')
+        r = self.post_save(1, 1, 'null', '', table='pa_nn')
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(r.get_json()['ok'])
+        self.assertEqual(self.dbrows('SELECT * FROM pa_nn ORDER BY id'), before)
+        # A NULL insert into an empty cell fails the same way.
+        r = self.post_save(2, 2, 'null', '', table='pa_nn')
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM pa_nn')[0][0], 1)
+
+    def test_invalid_value_rejected_before_any_write(self):
+        r = self.post_save(3, 1, 'integer', 'not-a-number')
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(
+            self.dbrows('SELECT COUNT(*) FROM pa '
+                        'WHERE product_id = 3 AND attribute_id = 1')[0][0], 0)
+        r = self.post_save(3, 1, 'integer', '99999999999999999999999999')
+        self.assertEqual(r.status_code, 400)
+
+    def test_duplicate_labels_do_not_cross_write(self):
+        # Products 2 and 3 share the name 'dup', attributes 3 and 4 too.
+        r = self.post_save(2, 3, 'text', 'only-for-2')
+        self.assertEqual(r.status_code, 200)
+        rows = self.dbrows(
+            'SELECT value FROM pa WHERE product_id = 2 AND attribute_id = 3')
+        self.assertEqual(rows, [('only-for-2',)])
+        # Same-labelled neighbors are untouched.
+        rows = self.dbrows(
+            'SELECT value FROM pa WHERE product_id = 3 AND attribute_id = 3')
+        self.assertEqual(rows, [(b'\x0a\xff',)])
+        self.assertEqual(
+            self.dbrows('SELECT COUNT(*) FROM pa '
+                        'WHERE product_id = 3 AND attribute_id = 4')[0][0], 0)
+        self.assertEqual(
+            self.dbrows('SELECT COUNT(*) FROM pa '
+                        'WHERE product_id = 2 AND attribute_id = 4')[0][0], 0)
+
+    def test_unique_pair_required(self):
+        r = self.client.get('/pa_flat/matrix/')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'UNIQUE', r.data)
+        self.assertNotIn(b'id="matrix-table"', r.data)
+
+    def test_single_integer_pk_required(self):
+        r = self.client.get('/pa_comp/matrix/')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'single-column integer primary key', r.data)
+        self.assertNotIn(b'id="matrix-table"', r.data)
+
+    def test_orphan_records_are_reported_not_hidden(self):
+        # Orphans arise when a writer had foreign-key enforcement off.
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('PRAGMA foreign_keys = OFF')
+        conn.execute("INSERT INTO pa (product_id, attribute_id, value) "
+                     "VALUES (99, 1, 'orphan')")
+        conn.commit()
+        conn.close()
+        r = self.client.get('/pa/matrix/')
+        self.assertIn(b'not shown in the matrix', r.data)
+        self.assertNotIn(b'orphan', r.data.split(b'matrix-table')[0])
+
+    def test_matrix_edit_visible_in_content_tab(self):
+        self.post_save(1, 1, 'text', 'matrix-wrote-this')
+        r = self.client.get('/pa/content/')
+        self.assertIn(b'matrix-wrote-this', r.data)
+
+    def test_form_and_sql_edits_visible_in_matrix(self):
+        token = key_encode([1])
+        r = self.client.post('/pa/update/%s/' % token,
+                             data={'value': 'from-form'})
+        self.assertIn(r.status_code, (302, 303))
+        r = self.client.get('/pa/matrix/')
+        self.assertIn(b'from-form', r.data)
+        self.client.post('/pa/query/', data={
+            'sql': "UPDATE pa SET value = 'from-sql' WHERE id = 1"})
+        r = self.client.get('/pa/matrix/')
+        self.assertIn(b'from-sql', r.data)
+
+    def test_bad_update_requests_are_rejected(self):
+        r = self.client.post('/pa/matrix/update/', data={})
+        self.assertEqual(r.status_code, 400)
+        r = self.matrix_post(action='remove', row_key=1, col_key=1,
+                             record='@@bad@@', base='x')
+        self.assertEqual(r.status_code, 400)
+        r = self.matrix_post(action='frobnicate', row_key=1, col_key=1,
+                             record='', base='empty')
+        self.assertEqual(r.status_code, 400)
+        # Nothing was written by any of the above.
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM pa')[0][0], 5)
+
+
+class TestMatrixReadOnly(BaseAppTestCase):
+    SCHEMA = TestMatrix.SCHEMA
+
+    def setUp(self):
+        super().setUp()
+        sw.datasets.clear()
+        sw.initialize_app([self.db_path], read_only=True)
+        self.client = sw.app.test_client()
+
+    def tearDown(self):
+        super().tearDown()
+        sw.dataset_config['read_only'] = False
+
+    def test_readonly_matrix_renders_without_editing(self):
+        r = self.client.get('/pa/matrix/')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'matrix-absent', r.data)
+        self.assertNotIn(b'matrix-editable', r.data)
+
+    def test_readonly_update_rejected(self):
+        r = self.client.post('/pa/matrix/update/', data={
+            'row_col': 'product_id', 'row_cat': 'product',
+            'col_col': 'attribute_id', 'col_cat': 'attribute',
+            'val_col': 'value', 'action': 'save',
+            'row_key': '3', 'col_key': '1',
+            'record': '', 'base': 'empty', 'vtype': 'text', 'value': 'x'})
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM pa')[0][0], 5)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -1297,6 +1297,416 @@ def table_row_detail(table, pk):
         table=table,
         table_pk=table_pk)
 
+#
+# Attribute matrix: edit an EAV "long table" as a grid whose rows and
+# columns are located by the primary keys of their catalog tables, so
+# duplicate catalog labels can never cross-write.
+#
+
+MATRIX_DISPLAY_LIMIT = 40
+
+MatrixConfig = namedtuple('MatrixConfig', (
+    'pk', 'row_col', 'row_cat', 'row_cat_pk', 'row_label',
+    'col_col', 'col_cat', 'col_cat_pk', 'col_label', 'val_col'))
+
+def _matrix_single_int_pk(dataset, table):
+    pks = [c for c in dataset.get_columns(table) if c.primary_key]
+    if len(pks) != 1 or 'INT' not in (pks[0].data_type or '').upper():
+        return None
+    return pks[0].name
+
+def _matrix_label_column(dataset, table, pk_name):
+    fallback = None
+    for column in dataset.get_columns(table):
+        if column.name == pk_name:
+            continue
+        data_type = (column.data_type or '').upper()
+        if any(token in data_type for token in ('CHAR', 'CLOB', 'TEXT')):
+            return column.name
+        if fallback is None:
+            fallback = column.name
+    return fallback
+
+def _matrix_unique_pair(dataset, table, col_a, col_b):
+    want = set((col_a, col_b))
+    return any(index.unique and set(index.columns) == want
+               for index in dataset.get_indexes(table))
+
+def _matrix_catalogs(dataset):
+    # Catalog candidates: real tables on a single-column integer key.
+    accum = []
+    for name in sorted(dataset.cached_tables()):
+        if dataset.cached_is_view(name):
+            continue
+        pk = _matrix_single_int_pk(dataset, name)
+        if pk is not None:
+            accum.append((name, pk))
+    return accum
+
+def _matrix_config(dataset, table, params):
+    """
+    Resolve the matrix mapping for a long table from request parameters,
+    defaulting key columns and catalogs from foreign-key metadata.
+    Returns (MatrixConfig, None) or (None, error-message).
+    """
+    pk = _matrix_single_int_pk(dataset, table)
+    if pk is None:
+        return None, ('The matrix needs a single-column integer primary '
+                      'key on this table.')
+    columns = [c.name for c in dataset.get_columns(table)]
+    fk_lookup = dataset.cached_fk_lookup(table)
+
+    row_col = params.get('row_col') or ''
+    col_col = params.get('col_col') or ''
+    val_col = params.get('val_col') or ''
+    if not row_col:
+        row_col = next((c for c in columns if c in fk_lookup), '')
+    if not col_col:
+        col_col = next((c for c in columns
+                        if c != row_col and c in fk_lookup), '')
+    if row_col not in columns:
+        return None, 'Choose the column holding the row (product) key.'
+    if col_col not in columns:
+        return None, 'Choose the column holding the column (attribute) key.'
+    if row_col == col_col:
+        return None, 'Row and column key columns must be different.'
+    if not val_col:
+        val_col = next((c for c in columns
+                        if c not in (pk, row_col, col_col)), '')
+    if val_col not in columns or val_col in (pk, row_col, col_col):
+        return None, 'Choose a value column distinct from the key columns.'
+
+    catalogs = dict(_matrix_catalogs(dataset))
+    resolved = []
+    for key_col, param in ((row_col, 'row_cat'), (col_col, 'col_cat')):
+        catalog = params.get(param) or ''
+        if not catalog and key_col in fk_lookup:
+            catalog = fk_lookup[key_col][0]
+        if catalog not in catalogs:
+            return None, ('Pick a catalog table with a single-column integer '
+                          'primary key for "%s".' % key_col)
+        resolved.append((catalog, catalogs[catalog]))
+    (row_cat, row_cat_pk), (col_cat, col_cat_pk) = resolved
+
+    if not _matrix_unique_pair(dataset, table, row_col, col_col):
+        return None, ('The matrix needs a UNIQUE constraint on (%s, %s) so '
+                      'each cell maps to at most one record.'
+                      % (row_col, col_col))
+
+    config = MatrixConfig(
+        pk=pk,
+        row_col=row_col,
+        row_cat=row_cat,
+        row_cat_pk=row_cat_pk,
+        row_label=_matrix_label_column(dataset, row_cat, row_cat_pk),
+        col_col=col_col,
+        col_cat=col_cat,
+        col_cat_pk=col_cat_pk,
+        col_label=_matrix_label_column(dataset, col_cat, col_cat_pk),
+        val_col=val_col)
+    return config, None
+
+def _matrix_value_type(value):
+    if value is None:
+        return 'null'
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return 'blob'
+    if isinstance(value, bool):
+        # sqlite has no boolean storage class; treat as integer.
+        return 'integer'
+    if isinstance(value, int):
+        return 'integer'
+    if isinstance(value, float):
+        return 'real'
+    return 'text'
+
+def _matrix_value_text(value, vtype):
+    if vtype == 'null':
+        return ''
+    if vtype == 'blob':
+        data = bytes(value)
+        if app.config['BLOB_AS_BASE64']:
+            return base64.b64encode(data).decode('utf8')
+        return data.hex()
+    if vtype == 'real':
+        return repr(value)
+    return str(value)
+
+def _matrix_fingerprint(vtype, text):
+    return hashlib.sha1(('%s\n%s' % (vtype, text)).encode('utf8')).hexdigest()
+
+def _matrix_display(vtype, value, text):
+    if vtype == 'null':
+        return Markup('<code class="matrix-null">NULL</code>')
+    if vtype == 'text' and value == '':
+        return Markup('<span class="matrix-empty-text" title="Empty string">'
+                      '&quot;&quot;</span>')
+    shown = text if len(text) <= MATRIX_DISPLAY_LIMIT else \
+        '%s…' % text[:MATRIX_DISPLAY_LIMIT]
+    if vtype == 'blob':
+        return Markup('<code class="matrix-blob" title="%s">%s</code>') % (
+            escape(text[:1024]), escape(shown))
+    return Markup('<span class="matrix-val" title="%s">%s</span>') % (
+        escape(text[:1024]), escape(shown))
+
+def _matrix_cell_state(record_pk, value, has_record):
+    if not has_record:
+        return {
+            'has_record': False, 'record': '', 'vtype': '', 'text': '',
+            'base': 'empty',
+            'display': Markup('<span class="matrix-absent" title="No record">'
+                              '&middot;</span>')}
+    vtype = _matrix_value_type(value)
+    text = _matrix_value_text(value, vtype)
+    return {
+        'has_record': True,
+        'record': key_encode([record_pk]),
+        'vtype': vtype,
+        'text': text,
+        'base': _matrix_fingerprint(vtype, text),
+        'display': _matrix_display(vtype, value, text)}
+
+def _matrix_parse_value(vtype, raw):
+    """
+    Convert submitted text to an exactly-typed value for binding, so the
+    storage class written is the one the user picked. (value, error).
+    """
+    if vtype == 'null':
+        return None, None
+    if vtype == 'text':
+        return raw, None
+    if vtype == 'integer':
+        if re.match(r'^[+-]?\d+$', raw.strip()):
+            value = int(raw.strip())
+            if -(2 ** 63) <= value <= 2 ** 63 - 1:
+                return value, None
+            return None, 'Integer is out of the 64-bit range.'
+        return None, 'Value is not a valid integer.'
+    if vtype == 'real':
+        try:
+            value = float(raw.strip())
+        except ValueError:
+            return None, 'Value is not a valid real number.'
+        if not math.isfinite(value):
+            # sqlite binds NaN as NULL, which would silently change class.
+            return None, 'Real value must be finite.'
+        return value, None
+    if vtype == 'blob':
+        try:
+            if app.config['BLOB_AS_BASE64']:
+                return base64.b64decode(raw, validate=True), None
+            return bytes.fromhex(raw), None
+        except Exception:
+            return None, ('Value must be valid %s.' %
+                          ('base64' if app.config['BLOB_AS_BASE64']
+                           else 'hex'))
+    return None, 'Unknown value type.'
+
+def _matrix_catalog_entries(dataset, catalog, pk, label):
+    if label:
+        sql = 'SELECT %s, %s FROM %s ORDER BY %s, %s' % (
+            quote_ident(pk), quote_ident(label), quote_ident(catalog),
+            quote_ident(label), quote_ident(pk))
+    else:
+        sql = 'SELECT %s FROM %s ORDER BY %s' % (
+            quote_ident(pk), quote_ident(catalog), quote_ident(pk))
+    entries = []
+    for row in dataset.query(sql).fetchall():
+        key = row[0]
+        text = row[1] if label else None
+        entries.append({
+            'key': key,
+            'label': str(text) if text is not None else '#%s' % (key,)})
+    return entries
+
+def _matrix_load(dataset, config, table):
+    rows = _matrix_catalog_entries(
+        dataset, config.row_cat, config.row_cat_pk, config.row_label)
+    cols = _matrix_catalog_entries(
+        dataset, config.col_cat, config.col_cat_pk, config.col_label)
+    row_keys = set(entry['key'] for entry in rows)
+    col_keys = set(entry['key'] for entry in cols)
+
+    sql = 'SELECT %s, %s, %s, %s FROM %s' % (
+        quote_ident(config.pk), quote_ident(config.row_col),
+        quote_ident(config.col_col), quote_ident(config.val_col),
+        quote_ident(table))
+    cells = {}
+    orphans = 0
+    for rec_pk, row_key, col_key, value in dataset.query(sql).fetchall():
+        if row_key not in row_keys or col_key not in col_keys:
+            # References a catalog entry that no longer exists. The matrix
+            # is catalog-driven, so count these instead of hiding them.
+            orphans += 1
+        else:
+            cells[(row_key, col_key)] = (rec_pk, value)
+    return rows, cols, cells, orphans
+
+@app.route('/<table>/matrix/')
+@require_table
+def table_matrix(table):
+    dataset = get_dataset()
+    dataset.ensure_cache()
+    config, error = _matrix_config(dataset, table, request.args)
+
+    grid = []
+    col_entries = []
+    orphans = 0
+    if config is not None:
+        rows, cols, cells, orphans = _matrix_load(dataset, config, table)
+        col_entries = cols
+        for rentry in rows:
+            line = []
+            for centry in cols:
+                state = cells.get((rentry['key'], centry['key']))
+                if state is None:
+                    cell = _matrix_cell_state(None, None, False)
+                else:
+                    cell = _matrix_cell_state(state[0], state[1], True)
+                cell['row_key'] = rentry['key']
+                cell['col_key'] = centry['key']
+                line.append(cell)
+            grid.append((rentry, line))
+
+    current = {
+        key: (getattr(config, key) if config is not None
+              else request.args.get(key) or '')
+        for key in ('row_col', 'row_cat', 'col_col', 'col_cat', 'val_col')}
+
+    return render_template(
+        'table_matrix.html',
+        allow_edit=not dataset.is_readonly,
+        blob_as_base64=app.config['BLOB_AS_BASE64'],
+        catalogs=_matrix_catalogs(dataset),
+        col_entries=col_entries,
+        columns=[c.name for c in dataset.get_columns(table)],
+        config=config,
+        current=current,
+        error=error,
+        grid=grid,
+        orphans=orphans,
+        table=table,
+        table_sql=dataset.cached_table_sql(table))
+
+@app.route('/<table>/matrix/update/', methods=['POST'])
+@require_table
+def table_matrix_update(table):
+    dataset = get_dataset()
+    dataset.ensure_cache()
+    if dataset.is_readonly:
+        return jsonify(ok=False, error='The database is read-only.'), 403
+
+    config, error = _matrix_config(dataset, table, request.form)
+    if config is None:
+        return jsonify(ok=False, error=error), 400
+
+    try:
+        row_key = int(request.form.get('row_key') or '')
+        col_key = int(request.form.get('col_key') or '')
+    except ValueError:
+        return jsonify(ok=False,
+                       error='Row and column keys must be integers.'), 400
+
+    action = request.form.get('action') or 'save'
+    record_token = request.form.get('record') or ''
+    base = request.form.get('base') or ''
+    if action == 'save':
+        value, error = _matrix_parse_value(request.form.get('vtype') or '',
+                                           request.form.get('value') or '')
+        if error:
+            return jsonify(ok=False, error=error), 400
+    elif action == 'remove':
+        value = None
+        if not record_token:
+            return jsonify(ok=False,
+                           error='This cell has no record to remove.'), 400
+    else:
+        return jsonify(ok=False, error='Unrecognized action.'), 400
+
+    if record_token:
+        try:
+            record_pk = key_decode(record_token)[0]
+        except Exception:
+            return jsonify(ok=False, error='Invalid record token.'), 400
+    else:
+        record_pk = None
+
+    cell_sql = 'SELECT %s, %s FROM %s WHERE %s = ? AND %s = ?' % (
+        quote_ident(config.pk), quote_ident(config.val_col),
+        quote_ident(table),
+        quote_ident(config.row_col), quote_ident(config.col_col))
+
+    def fetch_cell():
+        return dataset.query(cell_sql, (row_key, col_key)).fetchone()
+
+    def in_catalog(catalog, catalog_pk, key):
+        sql = 'SELECT 1 FROM %s WHERE %s = ?' % (
+            quote_ident(catalog), quote_ident(catalog_pk))
+        return dataset.query(sql, (key,)).fetchone() is not None
+
+    # One statement per cell inside one transaction: a constraint failure
+    # rolls back cleanly and can never touch a neighboring cell.
+    stale = None
+    cell = None
+    try:
+        with dataset.transaction():
+            if not in_catalog(config.row_cat, config.row_cat_pk, row_key) \
+                    or not in_catalog(config.col_cat, config.col_cat_pk,
+                                      col_key):
+                stale = 'The catalog entry for this cell no longer exists.'
+            else:
+                current = fetch_cell()
+                if record_token:
+                    if current is None or current[0] != record_pk:
+                        stale = ('The record for this cell was deleted or '
+                                 'replaced.')
+                    else:
+                        cur_vtype = _matrix_value_type(current[1])
+                        cur_text = _matrix_value_text(current[1], cur_vtype)
+                        if _matrix_fingerprint(cur_vtype, cur_text) != base:
+                            stale = ('The record for this cell was modified '
+                                     'elsewhere.')
+                elif current is not None:
+                    stale = 'A record for this cell was created elsewhere.'
+
+                if stale is None:
+                    if action == 'remove':
+                        dataset.query(
+                            'DELETE FROM %s WHERE %s = ?'
+                            % (quote_ident(table), quote_ident(config.pk)),
+                            (record_pk,))
+                    elif current is not None:
+                        # UPDATE by primary key: the record keeps its id.
+                        dataset.query(
+                            'UPDATE %s SET %s = ? WHERE %s = ?'
+                            % (quote_ident(table), quote_ident(config.val_col),
+                               quote_ident(config.pk)),
+                            (value, current[0]))
+                    else:
+                        dataset.query(
+                            'INSERT INTO %s (%s, %s, %s) VALUES (?, ?, ?)'
+                            % (quote_ident(table), quote_ident(config.row_col),
+                               quote_ident(config.col_col),
+                               quote_ident(config.val_col)),
+                            (row_key, col_key, value))
+                    new_row = fetch_cell()
+                    if new_row is None:
+                        cell = _matrix_cell_state(None, None, False)
+                    else:
+                        cell = _matrix_cell_state(new_row[0], new_row[1], True)
+    except DatabaseError as exc:
+        app.logger.exception('Matrix update failed.')
+        return jsonify(ok=False,
+                       error='The database rejected the change: %s' % exc), 400
+
+    if stale is not None:
+        return jsonify(ok=False, stale=True,
+                       error=stale + ' Reload the matrix and try again.'), 409
+
+    cell = dict(cell, row_key=row_key, col_key=col_key)
+    cell['display'] = str(cell['display'])
+    return jsonify(ok=True, cell=cell)
+
 @app.route('/<table>/query/', methods=['GET', 'POST'])
 def table_query(table):
     if table not in get_dataset().cached_tables():
